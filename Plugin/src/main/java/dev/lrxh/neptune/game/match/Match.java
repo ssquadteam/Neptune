@@ -78,6 +78,27 @@ public abstract class Match {
     private final Map<UUID, Long> lastDamageTime = new HashMap<>();
     
     /**
+     * Compatibility constructor that matches what subclasses expect
+     * 
+     * @param state The match state
+     * @param arena The arena
+     * @param kit The kit
+     * @param participants The participants
+     * @param rounds The number of rounds
+     * @param duel Whether this is a duel
+     * @param ended Whether the match has ended
+     */
+    public Match(MatchState state, Arena arena, Kit kit, List<Participant> participants, int rounds, boolean duel, boolean ended) {
+        this.state = state;
+        this.arena = arena;
+        this.kit = kit;
+        this.participants = participants;
+        this.rounds = rounds;
+        this.duel = duel;
+        this.ended = ended;
+    }
+    
+    /**
      * Inner class representing a chunk key for efficient block storage
      */
     @Getter
@@ -966,5 +987,31 @@ public abstract class Match {
         } catch (IllegalArgumentException e) {
             return null;
         }
+    }
+
+    /**
+     * Backward compatibility method for BlockTracker
+     * Checks if a location has been changed
+     * 
+     * @param location The location to check
+     * @return true if the location has been changed
+     */
+    public boolean hasBlockChange(Location location) {
+        ChunkKey chunkKey = ChunkKey.fromLocation(location);
+        BlockPosition blockPos = BlockPosition.fromLocation(location);
+        
+        Map<BlockPosition, BlockData> chunkChanges = chunkedChanges.get(chunkKey);
+        return chunkChanges != null && chunkChanges.containsKey(blockPos);
+    }
+    
+    /**
+     * Backward compatibility method for BlockTracker
+     * Adds a block change to tracking
+     * 
+     * @param location The location of the block
+     * @param blockData The original block data
+     */
+    public void addBlockChange(Location location, BlockData blockData) {
+        trackBlockChange(location, blockData);
     }
 }
