@@ -303,6 +303,16 @@ public abstract class Match {
         // Check global in-game scoreboard setting
         if (!SettingsLocale.ENABLED_SCOREBOARD_INGAME.getBoolean()) return new ArrayList<>();
 
+        // Check if this is a bedwars match first, since this is a special case regardless of match type
+        if (kit.is(KitRule.BED_WARS)) {
+            if (!SettingsLocale.ENABLED_SCOREBOARD_INGAME_BEDWARS.getBoolean()) return new ArrayList<>();
+            if (this instanceof SoloFightMatch) {
+                return PlaceholderUtil.format(new ArrayList<>(ScoreboardLocale.IN_GAME_BEDWARS.getStringList()), player);
+            } else if (this instanceof TeamFightMatch) {
+                return PlaceholderUtil.format(new ArrayList<>(ScoreboardLocale.IN_GAME_BEDWARS_TEAM.getStringList()), player);
+            }
+        }
+
         if (this instanceof SoloFightMatch) {
             MatchState matchState = this.getState();
 
@@ -367,9 +377,14 @@ public abstract class Match {
         Profile profile = API.getProfile(playerUUID);
         profile.setMatch(this);
         profile.setState(ProfileState.IN_GAME);
+        
+        // Always reset the player's inventory and status first
         PlayerUtil.reset(player);
+        
         Participant participant = getParticipant(playerUUID);
         participant.setLastAttacker(null);
+        
+        // Give the appropriate kit loadout
         kit.giveLoadout(participant);
     }
 

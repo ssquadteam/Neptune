@@ -10,6 +10,7 @@ import dev.lrxh.neptune.game.match.Match;
 import dev.lrxh.neptune.game.match.impl.MatchState;
 import dev.lrxh.neptune.game.match.impl.participant.DeathCause;
 import dev.lrxh.neptune.game.match.impl.participant.Participant;
+import dev.lrxh.neptune.game.match.impl.participant.ParticipantColor;
 import dev.lrxh.neptune.game.match.tasks.MatchEndRunnable;
 import dev.lrxh.neptune.game.match.tasks.MatchRespawnRunnable;
 import dev.lrxh.neptune.profile.data.ProfileState;
@@ -20,6 +21,7 @@ import dev.lrxh.neptune.utils.PlayerUtil;
 import lombok.Getter;
 import lombok.Setter;
 import org.bukkit.Bukkit;
+import org.bukkit.GameMode;
 import org.bukkit.Sound;
 import org.bukkit.entity.Player;
 
@@ -82,7 +84,31 @@ public class TeamFightMatch extends Match {
 
     @Override
     public void breakBed(Participant participant) {
-        getParticipantTeam(participant).forEachParticipant(participants -> participants.setBedBroken(true));
+        // Find which team's bed was broken - it should be the opponent's team
+        MatchTeam playerTeam = getParticipantTeam(participant);
+        MatchTeam opponentTeam = (playerTeam == teamA) ? teamB : teamA;
+        
+        // Set the bed as destroyed in the team
+        opponentTeam.setBedDestroyed(true);
+        
+        // Send sound effects to all players
+        playerTeam.forEachParticipant(p -> {
+            p.playSound(Sound.ENTITY_WITHER_DEATH);
+        });
+        
+        opponentTeam.forEachParticipant(p -> {
+            p.playSound(Sound.ENTITY_ENDER_DRAGON_GROWL);
+        });
+        
+        // Send titles and messages about the bed being destroyed
+        opponentTeam.sendTitle(MessagesLocale.BED_BREAK_TITLE.getString(), MessagesLocale.BED_BREAK_FOOTER.getString(), 20);
+        
+        // Broadcast a message about who broke the bed
+        String message = playerTeam.getParticipants().get(0).getColor().equals(ParticipantColor.RED) ? 
+            MessagesLocale.BLUE_BED_BROKEN_MESSAGE.getString() : 
+            MessagesLocale.RED_BED_BROKEN_MESSAGE.getString();
+            
+        forEachParticipant(p -> p.sendMessage(message.replace("<player>", participant.getNameColored())));
     }
 
     /**
@@ -151,8 +177,39 @@ public class TeamFightMatch extends Match {
                 killer.playSound(killer.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 1.0f, 1.0f);
             }
         }
+        
+        // Handle kit reset for RESET_INVENTORY_AFTER_DEATH first
+        // This ensures inventory reset always happens regardless of game mode
+        if (kit.is(KitRule.RESET_INVENTORY_AFTER_DEATH) && !kit.is(KitRule.BRIDGES)) {
+            // First fully reset the player's state
+            PlayerUtil.reset(participant.getPlayer());
+            // Make sure player is in SURVIVAL mode for the kit
+            participant.getPlayer().setGameMode(GameMode.SURVIVAL);
+            // Give them the original kit loadout they started with
+            kit.giveLoadout(participant);
+            // Update inventory to ensure changes are visible to the player
+            participant.getPlayer().updateInventory();
+        }
 
-        // Only score based on deaths if it's not a Bridges match
+        // Bedwars handling - respawn players if their bed is still intact
+        if (kit.is(KitRule.BED_WARS)) {
+            MatchTeam participantTeam = getParticipantTeam(participant);
+            
+            if (!participantTeam.isBedDestroyed()) {
+                // If the bed isn't broken, respawn the player
+                team.sendTitle("&cYou Died!", "&eRespawning in 5 seconds...", 40);
+                new MatchRespawnRunnable(this, participant, plugin).start(0L, 20L, plugin);
+                
+                // If there's a killer, reset their combo
+                if (participant.getLastAttacker() != null) {
+                    participant.getLastAttacker().setCombo(0);
+                }
+                
+                return; // Don't continue with death processing
+            }
+        }
+        
+        // Only score based on deaths if it's not a Bridges or Bedwars match
         if (!kit.is(KitRule.BRIDGES)) {
             // Check if the team is now a loser (all members dead)
             if (team.isLoser()) {
@@ -160,22 +217,21 @@ public class TeamFightMatch extends Match {
             }
         } else {
             // For Bridges mode, handle respawning
-            // Check if we should reset inventory for Bridges mode
-            boolean shouldResetInventory = true; // Always reset inventory in Bridges mode
+            // Always reset inventory in Bridges mode
+            boolean shouldResetInventory = true; 
 
             // Check if respawn delay is enabled
             if (kit.is(KitRule.RESPAWN_DELAY)) {
                 team.sendTitle("&cYou Died!", "&eRespawning in 5 seconds...", 40);
+                // MatchRespawnRunnable will handle inventory reset and kit loadout
                 new MatchRespawnRunnable(this, participant, plugin).start(0L, 20L, plugin);
             } else {
                 // For Bridges mode, handle instant respawning
                 team.sendTitle("&cYou Died!", "&eRespawning...", 10);
 
-                // Reset player inventory if needed
-                if (shouldResetInventory) {
-                    PlayerUtil.reset(participant.getPlayer());
-                    kit.giveLoadout(participant);
-                }
+                // Always reset player inventory in Bridges mode
+                PlayerUtil.reset(participant.getPlayer());
+                kit.giveLoadout(participant);
 
                 // Ensure player entity is properly removed from all clients
                 Player deadPlayer = participant.getPlayer();
@@ -202,12 +258,6 @@ public class TeamFightMatch extends Match {
                     });
                 }, 2L); // Small delay to ensure client-server sync
             }
-        }
-
-        // Check if we should reset inventory for other modes
-        if (kit.is(KitRule.RESET_INVENTORY_AFTER_DEATH) && !kit.is(KitRule.BRIDGES)) {
-            PlayerUtil.reset(participant.getPlayer());
-            kit.giveLoadout(participant);
         }
     }
 

@@ -28,6 +28,7 @@ import lombok.Getter;
 import lombok.Setter;
 import net.kyori.adventure.text.TextComponent;
 import org.bukkit.Bukkit;
+import org.bukkit.GameMode;
 import org.bukkit.Sound;
 import org.bukkit.entity.Player;
 
@@ -39,11 +40,24 @@ public class SoloFightMatch extends Match {
 
     private final Participant participantA;
     private final Participant participantB;
+    // Cache player information for stats persistence when players disconnect
+    private String cachedPlayerAUsername;
+    private String cachedPlayerBUsername;
 
     public SoloFightMatch(Arena arena, Kit kit, boolean duel, List<Participant> participants, Participant participantA, Participant participantB, int rounds) {
         super(MatchState.STARTING, arena, kit, participants, rounds, duel, false);
         this.participantA = participantA;
         this.participantB = participantB;
+        
+        // Cache player usernames at match start
+        Profile profileA = API.getProfile(participantA.getPlayerUUID());
+        Profile profileB = API.getProfile(participantB.getPlayerUUID());
+        if (profileA != null) {
+            this.cachedPlayerAUsername = profileA.getUsername();
+        }
+        if (profileB != null) {
+            this.cachedPlayerBUsername = profileB.getUsername();
+        }
     }
 
     @Override
@@ -97,6 +111,43 @@ public class SoloFightMatch extends Match {
         Profile winnerProfile = API.getProfile(winner.getPlayerUUID());
         Profile loserProfile = API.getProfile(loser.getPlayerUUID());
 
+        boolean hasWinnerProfile = (winnerProfile != null);
+        boolean hasLoserProfile = (loserProfile != null);
+        
+        // Handle cases where profiles are null due to disconnection
+        if (!hasWinnerProfile || !hasLoserProfile) {
+            plugin.getLogger().warning("Some profiles are null during stats recording: " + 
+                (!hasWinnerProfile ? "Winner profile is null" : "") + 
+                (!hasLoserProfile ? "Loser profile is null" : ""));
+            
+            // Try to use cached data for missing profiles
+            if (hasWinnerProfile && !hasLoserProfile) {
+                // Winner is still connected, but loser disconnected
+                String loserUsername = (loser == participantA) ? cachedPlayerAUsername : cachedPlayerBUsername;
+                if (loserUsername != null) {
+                    // We can still add stats for the winner at least
+                    winnerProfile.getGameData().addHistory(
+                            new MatchHistory(true, loserUsername, kit.getDisplayName(), arena.getDisplayName(), DateUtils.getDate()));
+                    winnerProfile.getGameData().run(kit, true);
+                    plugin.getLogger().info("Recorded win stats for " + winnerProfile.getUsername() + " against disconnected player " + loserUsername);
+                }
+            } else if (!hasWinnerProfile && hasLoserProfile) {
+                // Loser is still connected, but winner disconnected
+                String winnerUsername = (winner == participantA) ? cachedPlayerAUsername : cachedPlayerBUsername;
+                if (winnerUsername != null) {
+                    // We can still add stats for the loser at least
+                    loserProfile.getGameData().addHistory(
+                            new MatchHistory(false, winnerUsername, kit.getDisplayName(), arena.getDisplayName(), DateUtils.getDate()));
+                    loserProfile.getGameData().run(kit, false);
+                    plugin.getLogger().info("Recorded loss stats for " + loserProfile.getUsername() + " against disconnected player " + winnerUsername);
+                }
+            }
+            
+            // If both profiles are null, we can't do anything
+            return;
+        }
+
+        // Normal case - both profiles exist
         winnerProfile.getGameData().addHistory(
                 new MatchHistory(true, loserProfile.getUsername(), kit.getDisplayName(), arena.getDisplayName(), DateUtils.getDate()));
 
@@ -141,6 +192,12 @@ public class SoloFightMatch extends Match {
     @Override
     public void breakBed(Participant participant) {
         participant.setBedBroken(true);
+        
+        // Play Ender Dragon roar sound to the participant whose bed was broken
+        Player player = participant.getPlayer();
+        if (player != null) {
+            player.playSound(player.getLocation(), Sound.ENTITY_ENDER_DRAGON_GROWL, 1.0f, 1.0f);
+        }
     }
 
     /**
@@ -179,24 +236,36 @@ public class SoloFightMatch extends Match {
         sendDeathMessage(participant);
 
         if (!participant.isDisconnected() && !participant.isLeft()) {
+            // Handle kit reset for RESET_INVENTORY_AFTER_DEATH first
+            // This ensures inventory reset always happens regardless of game mode
+            if (kit.is(KitRule.RESET_INVENTORY_AFTER_DEATH) && !kit.is(KitRule.BRIDGES)) {
+                // First fully reset the player's state
+                PlayerUtil.reset(participant.getPlayer());
+                // Make sure player is in SURVIVAL mode for the kit
+                participant.getPlayer().setGameMode(GameMode.SURVIVAL);
+                // Give them the original kit loadout they started with
+                kit.giveLoadout(participant);
+                // Update inventory to ensure changes are visible to the player
+                participant.getPlayer().updateInventory();
+            }
+            
             // Special handling for Bridges - just respawn the player without resetting the match
             if (kit.is(KitRule.BRIDGES)) {
-                // Check if we should reset inventory for Bridges mode
-                boolean shouldResetInventory = true; // Always reset inventory in Bridges mode
-
+                // Always reset inventory in Bridges mode regardless of the respawn method
+                // This ensures consistent behavior between immediate respawns and delayed respawns
+                
                 // Check if respawn delay is enabled
                 if (kit.is(KitRule.RESPAWN_DELAY)) {
                     participant.sendTitle("&cYou Died!", "&eRespawning in 5 seconds...", 40);
+                    // The MatchRespawnRunnable will handle the inventory reset
                     new MatchRespawnRunnable(this, participant, plugin).start(0L, 20L, plugin);
                 } else {
                     // Instant respawn
                     participant.sendTitle("&cYou Died!", "&eRespawning...", 10);
 
-                    // Reset player inventory if needed
-                    if (shouldResetInventory) {
-                        PlayerUtil.reset(participant.getPlayer());
-                        kit.giveLoadout(participant);
-                    }
+                    // Reset player inventory
+                    PlayerUtil.reset(participant.getPlayer());
+                    kit.giveLoadout(participant);
 
                     // Ensure player entity is properly removed from all clients
                     Player deadPlayer = participant.getPlayer();
@@ -223,12 +292,6 @@ public class SoloFightMatch extends Match {
                     }, 2L); // Small delay to ensure client-server sync
                 }
                 return;
-            }
-
-            // Check if we should reset inventory for other modes
-            if (kit.is(KitRule.RESET_INVENTORY_AFTER_DEATH)) {
-                PlayerUtil.reset(participant.getPlayer());
-                kit.giveLoadout(participant);
             }
 
             // Original handling for BedWars
@@ -276,15 +339,26 @@ public class SoloFightMatch extends Match {
         // Ensure match state is set to ENDING
         state = MatchState.ENDING;
 
+        // Make sure cached username data is up-to-date before potential profile removal
+        Profile profile = API.getProfile(participant.getPlayerUUID());
+        if (profile != null) {
+            if (participant == participantA) {
+                cachedPlayerAUsername = profile.getUsername();
+            } else if (participant == participantB) {
+                cachedPlayerBUsername = profile.getUsername();
+            }
+        }
+
         if (quit) {
             participant.setDisconnected(true);
         } else {
             participant.setLeft(true);
             PlayerUtil.teleportToSpawn(participant.getPlayerUUID());
-            Profile profile = API.getProfile(participant.getPlayerUUID());
-            profile.setState(profile.getGameData().getParty() == null ? ProfileState.IN_LOBBY : ProfileState.IN_PARTY);
-            PlayerUtil.reset(participant.getPlayer());
-            profile.setMatch(null);
+            if (profile != null) {
+                profile.setState(profile.getGameData().getParty() == null ? ProfileState.IN_LOBBY : ProfileState.IN_PARTY);
+                PlayerUtil.reset(participant.getPlayer());
+                profile.setMatch(null);
+            }
         }
 
         // Always reset the arena when a player leaves to clean up placed blocks

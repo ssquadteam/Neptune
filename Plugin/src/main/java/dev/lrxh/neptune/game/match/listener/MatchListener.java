@@ -3,6 +3,7 @@ package dev.lrxh.neptune.game.match.listener;
 import dev.lrxh.neptune.API;
 import dev.lrxh.neptune.Neptune;
 import dev.lrxh.neptune.configs.impl.MessagesLocale;
+import dev.lrxh.neptune.game.arena.Arena;
 import dev.lrxh.neptune.game.arena.impl.StandAloneArena;
 import dev.lrxh.neptune.game.kit.Kit;
 import dev.lrxh.neptune.game.kit.impl.KitRule;
@@ -11,6 +12,7 @@ import dev.lrxh.neptune.game.match.impl.MatchState;
 import dev.lrxh.neptune.game.match.impl.participant.DeathCause;
 import dev.lrxh.neptune.game.match.impl.participant.Participant;
 import dev.lrxh.neptune.game.match.impl.participant.ParticipantColor;
+import dev.lrxh.neptune.game.match.impl.team.MatchTeam;
 import dev.lrxh.neptune.game.match.impl.team.TeamFightMatch;
 import dev.lrxh.neptune.profile.ProfileService;
 import dev.lrxh.neptune.profile.data.ProfileState;
@@ -28,6 +30,7 @@ import org.bukkit.Sound;
 import org.bukkit.block.Block;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.EntityType;
+import org.bukkit.entity.Item;
 import org.bukkit.entity.Player;
 import org.bukkit.entity.Projectile;
 import org.bukkit.event.EventHandler;
@@ -63,6 +66,11 @@ public class MatchListener implements Listener {
             Match match = profile.getMatch();
             Participant participant = match.getParticipant(player.getUniqueId());
             if (participant == null) return;
+            
+            // Skip processing if the participant is already marked as dead
+            // This prevents duplicate death processing when we manually handle it in EntityDamageByEntityEvent
+            if (participant.isDead()) return;
+            
             participant.setDeathCause(participant.getLastAttacker() != null ? DeathCause.KILL : DeathCause.DIED);
             match.onDeath(participant);
         }
@@ -71,6 +79,12 @@ public class MatchListener implements Listener {
     @EventHandler
     public void onItemPickup(EntityPickupItemEvent event) {
         if (event.getEntity() instanceof Player player) {
+            // Check if the item being picked up is a bed item and cancel the pickup if it is
+            if (event.getItem().getItemStack().getType().name().contains("BED")) {
+                event.setCancelled(true);
+                return;
+            }
+            
             if (player.getGameMode().equals(GameMode.CREATIVE)) return;
             Profile profile = API.getProfile(player);
 
@@ -88,34 +102,104 @@ public class MatchListener implements Listener {
         Material blockType = event.getBlock().getType();
 
         if (match == null) return;
+        if (!match.getKit().is(KitRule.BED_WARS)) return;
 
-        if (match.getKit().is(KitRule.BED_WARS)) {
-            if (blockType == Material.OAK_PLANKS || blockType == Material.END_STONE) {
-                event.setCancelled(false);
-            }
+        // Allow breaking specific blocks in bedwars mode
+        if (blockType == Material.OAK_PLANKS || blockType == Material.END_STONE || blockType.toString().contains("WOOL")) {
+            event.setCancelled(false);
+            return;
         }
 
-        if (event.getBlock().getType().toString().contains("BED")) {
-            Location bed = event.getBlock().getLocation();
-
+        // Handle bed breaking
+        if (blockType.toString().contains("BED")) {
+            event.setCancelled(true); // Cancel initially, we'll handle it manually
+            
+            Location bedLocation = event.getBlock().getLocation();
             Participant participant = match.getParticipant(player.getUniqueId());
             if (participant == null) return;
-            Location spawn = match.getSpawn(participant);
-            Participant opponent = participant.getOpponent();
-            Location opponentSpawn = match.getSpawn(opponent);
-            ParticipantColor color = participant.getColor();
-
-            if (bed.distanceSquared(spawn) > bed.distanceSquared(opponentSpawn)) {
-                match.breakBed(opponent);
-                match.sendTitle(opponent, MessagesLocale.BED_BREAK_TITLE.getString(), MessagesLocale.BED_BREAK_FOOTER.getString(), 20);
-                match.broadcast(color.equals(ParticipantColor.RED) ? MessagesLocale.BLUE_BED_BROKEN_MESSAGE : MessagesLocale.RED_BED_BROKEN_MESSAGE, new Replacement("<player>", participant.getNameColored()));
+            
+            // Get the other part of the bed
+            Location otherBedPart = getOtherBedPart(bedLocation);
+            
+            // Determine which team the bed belongs to
+            boolean isOwnBed = false;
+            
+            if (match instanceof TeamFightMatch teamMatch) {
+                MatchTeam playerTeam = teamMatch.getParticipantTeam(participant);
+                MatchTeam opponentTeam = (playerTeam == teamMatch.getTeamA()) ? teamMatch.getTeamB() : teamMatch.getTeamA();
+                
+                // Check if this is the player's own bed by comparing distances
+                // The bed is closer to the team's spawn that it belongs to
+                double distToPlayerTeamSpawn = bedLocation.distanceSquared(match.getSpawn(playerTeam.getParticipants().get(0)));
+                double distToOpponentTeamSpawn = bedLocation.distanceSquared(match.getSpawn(opponentTeam.getParticipants().get(0)));
+                
+                isOwnBed = distToPlayerTeamSpawn < distToOpponentTeamSpawn;
+                
+                if (isOwnBed) {
+                    participant.sendMessage(MessagesLocale.CANT_BREAK_OWN_BED);
+                } else {
+                    // Play Ender Dragon roar sound to all players in the match
+                    match.forEachPlayer(p -> p.playSound(p.getLocation(), Sound.ENTITY_ENDER_DRAGON_GROWL, 1.0f, 1.0f));
+                    
+                    // Break the opponent's bed
+                    teamMatch.breakBed(participant);
+                    
+                    // Break both bed blocks
+                    bedLocation.getBlock().setType(Material.AIR);
+                    if (otherBedPart != null) {
+                        otherBedPart.getBlock().setType(Material.AIR);
+                    }
+                }
             } else {
-                event.setCancelled(true);
-                participant.sendMessage(MessagesLocale.CANT_BREAK_OWN_BED);
+                // For 1v1 matches
+                Location spawn = match.getSpawn(participant);
+                Participant opponent = participant.getOpponent();
+                Location opponentSpawn = match.getSpawn(opponent);
+                ParticipantColor color = participant.getColor();
+
+                if (bedLocation.distanceSquared(spawn) > bedLocation.distanceSquared(opponentSpawn)) {
+                    // Play Ender Dragon roar sound to all players in the match
+                    match.forEachPlayer(p -> p.playSound(p.getLocation(), Sound.ENTITY_ENDER_DRAGON_GROWL, 1.0f, 1.0f));
+                    
+                    match.breakBed(opponent);
+                    match.sendTitle(opponent, MessagesLocale.BED_BREAK_TITLE.getString(), MessagesLocale.BED_BREAK_FOOTER.getString(), 20);
+                    match.broadcast(color.equals(ParticipantColor.RED) ? MessagesLocale.BLUE_BED_BROKEN_MESSAGE : MessagesLocale.RED_BED_BROKEN_MESSAGE, 
+                        new Replacement("<player>", participant.getNameColored()));
+                    
+                    // Break both bed blocks
+                    bedLocation.getBlock().setType(Material.AIR);
+                    if (otherBedPart != null) {
+                        otherBedPart.getBlock().setType(Material.AIR);
+                    }
+                } else {
+                    participant.sendMessage(MessagesLocale.CANT_BREAK_OWN_BED);
+                }
             }
         }
     }
-
+    
+    /**
+     * Get the other part of a bed (a bed consists of two blocks)
+     * @param bedLocation The location of one part of the bed
+     * @return The location of the other part of the bed, or null if not found
+     */
+    private Location getOtherBedPart(Location bedLocation) {
+        // Check the blocks in the four cardinal directions
+        Location[] adjacentLocations = {
+            bedLocation.clone().add(1, 0, 0),
+            bedLocation.clone().add(-1, 0, 0),
+            bedLocation.clone().add(0, 0, 1),
+            bedLocation.clone().add(0, 0, -1)
+        };
+        
+        for (Location adjacent : adjacentLocations) {
+            if (adjacent.getBlock().getType().toString().contains("BED")) {
+                return adjacent;
+            }
+        }
+        
+        return null;
+    }
 
     @EventHandler
     public void onPlayerBucketEmpty(PlayerBucketEmptyEvent event) {
@@ -184,6 +268,20 @@ public class MatchListener implements Listener {
 
             if (event.getFinalDamage() >= player.getHealth()) {
                 PlayerUtil.playDeathAnimation(player, attacker, match.getPlayers());
+                
+                // This is a lethal hit - explicitly handle player death to ensure proper reset 
+                Participant participant = match.getParticipant(player.getUniqueId());
+                if (participant != null && !participant.isDead()) {
+                    // Set the last attacker
+                    participant.setLastAttacker(match.getParticipant(attacker.getUniqueId()));
+                    // Set death cause explicitly to KILL for player kills
+                    participant.setDeathCause(DeathCause.KILL);
+                    // Call onDeath to process death, inventory reset, etc.
+                    match.onDeath(participant);
+                    // Cancel the damage event since we're handling death manually
+                    event.setCancelled(true);
+                    return;
+                }
             }
 
             if (match instanceof TeamFightMatch teamFightMatch) {
@@ -719,6 +817,16 @@ public class MatchListener implements Listener {
 
         if (match != null && match.getKit().is(KitRule.INFINITE_DURABILITY)) {
             // Cancel the event to prevent item from taking durability damage
+            event.setCancelled(true);
+        }
+    }
+
+    @EventHandler
+    public void onItemSpawn(ItemSpawnEvent event) {
+        Item item = event.getEntity();
+        // Check if the spawned item is a bed
+        if (item != null && item.getItemStack().getType().name().contains("BED")) {
+            // Cancel the spawn of bed items
             event.setCancelled(true);
         }
     }
