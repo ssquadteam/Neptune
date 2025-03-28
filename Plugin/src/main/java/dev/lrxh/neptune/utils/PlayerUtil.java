@@ -11,6 +11,8 @@ import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEn
 import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityVelocity;
 import dev.lrxh.neptune.API;
 import dev.lrxh.neptune.Neptune;
+import dev.lrxh.neptune.game.match.impl.participant.Participant;
+import dev.lrxh.neptune.game.match.impl.team.MatchTeam;
 import dev.lrxh.neptune.profile.data.ProfileState;
 import dev.lrxh.neptune.profile.impl.Profile;
 import io.github.retrooper.packetevents.util.SpigotConversionUtil;
@@ -180,5 +182,63 @@ public class PlayerUtil {
         player.setVelocity(player.getVelocity().add(new Vector(0, 0.15, 0)));
         player.setAllowFlight(true);
         player.setFlying(true);
+    }
+
+    /**
+     * Handles player respawn with optimized visibility management and teleportation.
+     * Hides player from nearby players, teleports them to spawn, then shows them again.
+     * 
+     * @param deadPlayer The player who died and is respawning
+     * @param participant The participant object associated with the player
+     * @param spawnLocation The location to respawn the player
+     * @param team The team the player belongs to (can be null for solo matches)
+     * @param nearbyPlayers Collection of players in the match
+     * @param plugin The plugin instance for scheduling
+     */
+    public void handlePlayerRespawn(Player deadPlayer, Participant participant, 
+                                 Location spawnLocation, MatchTeam team,
+                                 List<Player> nearbyPlayers, Neptune plugin) {
+        if (deadPlayer == null || !deadPlayer.isOnline()) return;
+        
+        // Optimization 1: Only hide from players within visible range (instead of all players)
+        // This reduces packet sending for large servers
+        final int visibleRange = Bukkit.getViewDistance() * 16; // Convert chunks to blocks
+        final Location deadPlayerLocation = deadPlayer.getLocation();
+        
+        // Find players who need visibility updates (within range)
+        List<Player> playersInRange = nearbyPlayers.stream()
+            .filter(other -> other != deadPlayer && 
+                    other.getWorld().equals(deadPlayer.getWorld()) && 
+                    other.getLocation().distanceSquared(deadPlayerLocation) <= (visibleRange * visibleRange))
+            .toList();
+            
+        // Hide player from nearby players
+        for (Player otherPlayer : playersInRange) {
+            otherPlayer.hidePlayer(plugin, deadPlayer);
+        }
+        
+        // Use a single task instead of chaining tasks for better performance
+        Bukkit.getScheduler().runTaskLater(plugin, () -> {
+            try {
+                // Teleport player to spawn
+                deadPlayer.teleport(spawnLocation);
+                
+                // Update participant status
+                participant.setDead(false);
+                
+                // Optimization 2: Only update team status if in team match
+                if (team != null && team.getDeadParticipants().contains(participant)) {
+                    team.getDeadParticipants().remove(participant);
+                }
+                
+                // Show player to nearby players
+                for (Player otherPlayer : playersInRange) {
+                    otherPlayer.showPlayer(plugin, deadPlayer);
+                }
+            } catch (Exception e) {
+                // Error logging for easier debugging
+                plugin.getLogger().warning("Error during player respawn: " + e.getMessage());
+            }
+        }, 2L); // Keep existing delay for client sync
     }
 }

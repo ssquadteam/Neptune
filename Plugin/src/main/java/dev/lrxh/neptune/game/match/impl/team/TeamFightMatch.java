@@ -25,6 +25,7 @@ import org.bukkit.GameMode;
 import org.bukkit.Sound;
 import org.bukkit.entity.Player;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
@@ -236,27 +237,10 @@ public class TeamFightMatch extends Match {
                 // Ensure player entity is properly removed from all clients
                 Player deadPlayer = participant.getPlayer();
 
-                // Fix ghost player bug - force player to be hidden from all players
-                forEachPlayer(otherPlayer -> {
-                    if (otherPlayer != deadPlayer) {
-                        otherPlayer.hidePlayer(Neptune.get(), deadPlayer);
-                    }
-                });
-
-                // Delay showing the player to ensure client sync
-                Bukkit.getScheduler().runTaskLater(Neptune.get(), () -> {
-                    // Teleport the player to their spawn
-                    deadPlayer.teleport(getSpawn(participant));
-                    participant.setDead(false);
-                    team.getDeadParticipants().remove(participant);
-
-                    // Show the player to everyone again after a brief delay
-                    forEachPlayer(otherPlayer -> {
-                        if (otherPlayer != deadPlayer) {
-                            otherPlayer.showPlayer(Neptune.get(), deadPlayer);
-                        }
-                    });
-                }, 2L); // Small delay to ensure client-server sync
+                // Use optimized respawn handler
+                List<Player> allPlayers = new ArrayList<>();
+                forEachPlayer(allPlayers::add);
+                PlayerUtil.handlePlayerRespawn(deadPlayer, participant, getSpawn(participant), team, allPlayers, Neptune.get());
             }
         }
     }

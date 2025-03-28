@@ -32,6 +32,7 @@ import org.bukkit.GameMode;
 import org.bukkit.Sound;
 import org.bukkit.entity.Player;
 
+import java.util.ArrayList;
 import java.util.List;
 
 @Getter
@@ -228,105 +229,126 @@ public class SoloFightMatch extends Match {
     @Override
     public void onDeath(Participant participant) {
         if (isEnded()) return;
+        
+        // Hide the player model and mark as dead
         hideParticipant(participant);
-
         participant.setDead(true);
-
-        Participant participantKiller = participantA.getNameColored().equals(participant.getNameColored()) ? participantB : participantA;
+        
+        // Determine killer and send death message
+        Participant killer = participantA.getNameColored().equals(participant.getNameColored()) ? participantB : participantA;
         sendDeathMessage(participant);
-
-        if (!participant.isDisconnected() && !participant.isLeft()) {
-            // Handle kit reset for RESET_INVENTORY_AFTER_DEATH first
-            // This ensures inventory reset always happens regardless of game mode
-            if (kit.is(KitRule.RESET_INVENTORY_AFTER_DEATH) && !kit.is(KitRule.BRIDGES)) {
-                // First fully reset the player's state
-                PlayerUtil.reset(participant.getPlayer());
-                // Make sure player is in SURVIVAL mode for the kit
-                participant.getPlayer().setGameMode(GameMode.SURVIVAL);
-                // Give them the original kit loadout they started with
-                kit.giveLoadout(participant);
-                // Update inventory to ensure changes are visible to the player
-                participant.getPlayer().updateInventory();
-            }
-            
-            // Special handling for Bridges - just respawn the player without resetting the match
-            if (kit.is(KitRule.BRIDGES)) {
-                // Always reset inventory in Bridges mode regardless of the respawn method
-                // This ensures consistent behavior between immediate respawns and delayed respawns
-                
-                // Check if respawn delay is enabled
-                if (kit.is(KitRule.RESPAWN_DELAY)) {
-                    participant.sendTitle("&cYou Died!", "&eRespawning in 5 seconds...", 40);
-                    // The MatchRespawnRunnable will handle the inventory reset
-                    new MatchRespawnRunnable(this, participant, plugin).start(0L, 20L, plugin);
-                } else {
-                    // Instant respawn
-                    participant.sendTitle("&cYou Died!", "&eRespawning...", 10);
-
-                    // Reset player inventory
-                    PlayerUtil.reset(participant.getPlayer());
-                    kit.giveLoadout(participant);
-
-                    // Ensure player entity is properly removed from all clients
-                    Player deadPlayer = participant.getPlayer();
-
-                    // Fix ghost player bug - force player to be hidden from all players
-                    forEachPlayer(otherPlayer -> {
-                        if (otherPlayer != deadPlayer) {
-                            otherPlayer.hidePlayer(Neptune.get(), deadPlayer);
-                        }
-                    });
-
-                    // Delay showing the player to ensure client sync
-                    Bukkit.getScheduler().runTaskLater(Neptune.get(), () -> {
-                        // Teleport the player to their spawn
-                        deadPlayer.teleport(getSpawn(participant));
-                        participant.setDead(false);
-
-                        // Show the player to everyone again after a brief delay
-                        forEachPlayer(otherPlayer -> {
-                            if (otherPlayer != deadPlayer) {
-                                otherPlayer.showPlayer(Neptune.get(), deadPlayer);
-                            }
-                        });
-                    }, 2L); // Small delay to ensure client-server sync
-                }
-                return;
-            }
-
-            // Original handling for BedWars
-            if (kit.is(KitRule.BED_WARS)) {
-                if (!participant.isBedBroken()) {
-                    participantKiller.setCombo(0);
-                    new MatchRespawnRunnable(this, participant, plugin).start(0L, 20L, plugin);
-                    return;
-                }
-            }
-
-            if (rounds > 1) {
-                // Only score a point for kills if not in Bridges mode
-                if (!kit.is(KitRule.BRIDGES)) {
-                    participantKiller.addWin();
-                }
-
-                if (participantKiller.getRoundsWon() < rounds) {
-                    participantKiller.setCombo(0);
-
-                    state = MatchState.STARTING;
-                    new MatchSecondRoundRunnable(this, participant, plugin).start(0L, 20L, plugin);
-                    return;
-                }
-            }
+        
+        // Handle disconnected or left players
+        if (participant.isDisconnected() || participant.isLeft()) {
+            endMatchWithParticipantAsLoser(participant);
+            return;
         }
-
+        
+        // Handle game mode-specific death behaviors
+        if (handleGameModeSpecificDeath(participant, killer)) {
+            return; // Death was handled by game mode logic
+        }
+        
+        // Standard death - end the match
+        endMatchWithParticipantAsLoser(participant);
+    }
+    
+    /**
+     * Handles game mode-specific death behavior
+     * @return true if death was fully handled, false if default behavior should continue
+     */
+    private boolean handleGameModeSpecificDeath(Participant participant, Participant killer) {
+        // Reset inventory if the kit requires it
+        if (kit.is(KitRule.RESET_INVENTORY_AFTER_DEATH) && !kit.is(KitRule.BRIDGES)) {
+            resetPlayerInventory(participant);
+        }
+        
+        // Handle Bridges mode 
+        if (kit.is(KitRule.BRIDGES)) {
+            handleBridgesDeath(participant);
+            return true;
+        }
+        
+        // Handle BedWars mode
+        if (kit.is(KitRule.BED_WARS) && !participant.isBedBroken()) {
+            killer.setCombo(0);
+            new MatchRespawnRunnable(this, participant, plugin).start(0L, 20L, plugin);
+            return true;
+        }
+        
+        // Handle multi-round matches
+        if (rounds > 1) {
+            return handleMultiRoundDeath(participant, killer);
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Handles respawning in Bridges mode
+     */
+    private void handleBridgesDeath(Participant participant) {
+        // Check if respawn delay is enabled
+        if (kit.is(KitRule.RESPAWN_DELAY)) {
+            participant.sendTitle("&cYou Died!", "&eRespawning in 5 seconds...", 40);
+            new MatchRespawnRunnable(this, participant, plugin).start(0L, 20L, plugin);
+        } else {
+            // Instant respawn
+            participant.sendTitle("&cYou Died!", "&eRespawning...", 10);
+            
+            // Reset player inventory
+            resetPlayerInventory(participant);
+            
+            // Handle respawn
+            Player deadPlayer = participant.getPlayer();
+            List<Player> allPlayers = new ArrayList<>();
+            forEachPlayer(allPlayers::add);
+            PlayerUtil.handlePlayerRespawn(deadPlayer, participant, getSpawn(participant), null, allPlayers, Neptune.get());
+        }
+    }
+    
+    /**
+     * Handles death in multi-round matches
+     * @return true if death was fully handled, false if match should end
+     */
+    private boolean handleMultiRoundDeath(Participant participant, Participant killer) {
+        // Only score a point for kills if not in Bridges mode
+        if (!kit.is(KitRule.BRIDGES)) {
+            killer.addWin();
+        }
+        
+        // If killer hasn't won enough rounds yet, start new round
+        if (killer.getRoundsWon() < rounds) {
+            killer.setCombo(0);
+            state = MatchState.STARTING;
+            new MatchSecondRoundRunnable(this, participant, plugin).start(0L, 20L, plugin);
+            return true;
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Resets a player's inventory and gives them their kit
+     */
+    private void resetPlayerInventory(Participant participant) {
+        PlayerUtil.reset(participant.getPlayer());
+        participant.getPlayer().setGameMode(GameMode.SURVIVAL);
+        kit.giveLoadout(participant);
+        participant.getPlayer().updateInventory();
+    }
+    
+    /**
+     * Ends the match with the specified participant as the loser
+     */
+    private void endMatchWithParticipantAsLoser(Participant participant) {
+        // Play sound to last attacker
         if (participant.getLastAttacker() != null) {
             participant.getLastAttacker().playSound(Sound.UI_BUTTON_CLICK);
         }
-
+        
         this.setEnded(true);
-
         PlayerUtil.doVelocityChange(participant.getPlayerUUID());
-
         end(participant);
     }
 
